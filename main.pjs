@@ -1,0 +1,7 @@
+createServerSocket = {import:server-plugin}
+
+$meta
+  title = OpenCall — one-link video chat
+  description = No rooms, no sign-up, no lobby: everyone who opens this link joins the same live video call. Peer-to-peer video, screen share, chat, raise hand. Free.
+  header
+    mode = minimal

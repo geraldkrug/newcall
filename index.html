@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Newcall Video room and chat</title>
+</head>
+<body>
+<script type="text/x-server-plugin">
+// OpenCall signaling router — one shared call, no rooms.
+// Ephemeral only: peers re-announce (open + heartbeat), so hibernation self-heals.
+// Routes: hi/roster/join (presence), directed sig (SDP/ICE), chat + state broadcast.
+var TOPIC = "call";
+var peers = new Map(); // peerId -> conn
+var names = new Map(); // peerId -> display name
+var conns = new Map(); // conn -> {id, name, n, winStart}
+
+function validId(id) {
+  if (typeof id !== "string" || id.length < 4 || id.length > 40) return false;
+  for (var i = 0; i < id.length; i++) {
+    var c = id.charCodeAt(i);
+    var ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 45;
+    if (!ok) return false;
+  }
+  return true;
+}
+function cleanName(n) {
+  if (typeof n !== "string") return "Guest";
+  n = n.slice(0, 24);
+  return n.length ? n : "Guest";
+}
+
+self.onopen = function(e) {
+  try { e.conn.subscribe(TOPIC); } catch (err) {}
+};
+
+self.onmessage = function(e) {
+  var conn = e.conn, data = e.data;
+  try {
+    var len = typeof data === "string" ? data.length : data.byteLength;
+    if (len > 65536 || len < 2) return;
+    var str = typeof data === "string" ? data : new TextDecoder().decode(data);
+    var m;
+    try { m = JSON.parse(str); } catch (err) { return; }
+    if (!m || typeof m.t !== "string") return;
+    var now = Date.now();
+    var rec = conns.get(conn);
+    if (!rec) { rec = {id: null, name: "", n: 0, winStart: 0}; conns.set(conn, rec); }
+    if (now - rec.winStart > 10000) { rec.winStart = now; rec.n = 0; }
+    rec.n++;
+    if (rec.n > 150) return; // sliding 10s window: ~15 msg/s per connection
+    if (m.t === "hi") onHi(conn, rec, m);
+    else if (m.t === "sig") onSig(conn, rec, m);
+    else if (m.t === "chat") onChat(conn, rec, m);
+    else if (m.t === "react") onReact(conn, rec, m);
+    else if (m.t === "state") onState(conn, rec, m);
+  } catch (err) {}
+};
+
+self.onclose = function(e) {
+  var conn = e.conn;
+  var rec = conns.get(conn);
+  conns.delete(conn);
+  if (rec && rec.id) {
+    if (peers.get(rec.id) === conn) peers.delete(rec.id);
+    try { pubsub.publish(TOPIC, JSON.stringify({t: "leave", id: rec.id})); } catch (err) {}
+  }
+};
+
+function onHi(conn, rec, m) {
+  if (!validId(m.id)) return;
+  var name = cleanName(m.name);
+  var other = peers.get(m.id);
+  if (other && other !== conn) {
+    try { conn.send(JSON.stringify({t: "taken"})); } catch (err) {}
+    return;
+  }
+  rec.id = m.id; rec.name = name;
+  peers.forEach(function(c, id) { if (c === conn && id !== m.id) peers.delete(id); });
+  peers.set(m.id, conn);
+  names.set(m.id, name);
+  if (m.hb) return; // heartbeat: refresh registration only
+  var roster = [];
+  peers.forEach(function(c, id) {
+    if (c !== conn && roster.length < 400) roster.push({id: id, name: names.get(id) || "Guest"});
+  });
+  try { conn.send(JSON.stringify({t: "roster", peers: roster})); } catch (err) {}
+  try { pubsub.publish(TOPIC, JSON.stringify({t: "join", id: m.id, name: name})); } catch (err) {}
+}
+
+function onSig(conn, rec, m) {
+  if (!rec.id) return;
+  if (!validId(m.to)) return;
+  var kind = m.kind;
+  if (kind !== "offer" && kind !== "answer" && kind !== "ice") return;
+  var p = m.payload;
+  if (!p || typeof p !== "object") return;
+  var target = peers.get(m.to);
+  if (!target) {
+    try { conn.send(JSON.stringify({t: "nop", id: m.to})); } catch (err) {}
+    return;
+  }
+  try {
+    target.send(JSON.stringify({t: "sig", from: rec.id, kind: kind, payload: p}));
+  } catch (err) {
+    try { conn.send(JSON.stringify({t: "nop", id: m.to})); } catch (e2) {}
+  }
+}
+
+function onChat(conn, rec, m) {
+  if (!rec.id) return;
+  if (typeof m.text !== "string") return;
+  var text = m.text.slice(0, 500);
+  if (!text) return;
+  try {
+    pubsub.publish(TOPIC, JSON.stringify({t: "chat", id: rec.id, name: rec.name, text: text, ts: Date.now()}));
+  } catch (err) {}
+}
+
+var EMOS = ["👍", "❤️", "😂", "🎉", "👏", "😮"];
+function onReact(conn, rec, m) {
+  if (!rec.id) return;
+  if (typeof m.emo !== "string" || EMOS.indexOf(m.emo) < 0) return;
+  try {
+    pubsub.publish(TOPIC, JSON.stringify({t: "react", id: rec.id, name: rec.name, emo: m.emo}));
+  } catch (err) {}
+}
+
+function onState(conn, rec, m) {
+  if (!rec.id) return;
+  var out = {t: "state", id: rec.id};
+  var changed = false;
+  if (typeof m.name === "string") {
+    var nm = cleanName(m.name);
+    if (nm !== rec.name) { rec.name = nm; names.set(rec.id, nm); out.name = nm; changed = true; }
+  }
+  if (typeof m.hand === "boolean") { out.hand = m.hand; changed = true; }
+  if (typeof m.mic === "boolean") { out.mic = m.mic; changed = true; }
+  if (typeof m.cam === "boolean") { out.cam = m.cam; changed = true; }
+  if (typeof m.sharing === "boolean") { out.sharing = m.sharing; changed = true; }
+  if (!changed) return;
+  try { pubsub.publish(TOPIC, JSON.stringify(out)); } catch (err) {}
+}
+</script>
+<link rel="stylesheet" href="src/call.css">
+<div class="call" id="callApp">
+  <div class="banner" id="errBanner" hidden></div>
+  <div class="gate" id="audioGate" hidden>Sound is muted until you tap anywhere — tap to enable audio</div>
+  <header class="topbar">
+    <div class="brand"><span class="logo">◉</span><div><strong>OpenCall</strong><small>one link · everyone in</small></div></div>
+    <div class="netwrap"><span class="dot" id="netDot"></span><span id="countEl">connecting…</span></div>
+    <div class="controls">
+      <button class="cbtn" id="copyBtn" title="copy the link — everyone who opens it joins this call">Copy link</button>
+      <button class="cbtn" id="chatBtn" title="chat and people">Chat <span class="badge" id="chatBadge" hidden></span></button>
+      <button class="cbtn" id="shareBtn" title="share your screen">Share</button>
+      <button class="cbtn tgl on" id="micBtn" title="mute / unmute">Mic</button>
+      <button class="cbtn tgl on" id="camBtn" title="camera on / off">Cam</button>
+      <button class="cbtn" id="handBtn" title="raise / lower hand">Hand</button>
+      <button class="cbtn emo" data-emo="👍" title="thumbs up">👍</button>
+      <button class="cbtn emo" data-emo="❤️" title="love it">❤️</button>
+      <button class="cbtn emo" data-emo="😂" title="laugh">😂</button>
+      <button class="cbtn" id="setBtn" title="name and devices">Settings</button>
+      <button class="cbtn danger" id="leaveBtn" title="leave the call">Leave</button>
+    </div>
+  </header>
+  <div class="stage">
+    <main class="grid" id="gridEl"></main>
+    <aside class="side" id="sideEl" hidden>
+      <div class="tabs">
+        <button class="tab on" id="tabChatBtn">Chat</button>
+        <button class="tab" id="tabPeopleBtn">People</button>
+      </div>
+      <div class="pane" id="chatPane">
+        <ul class="chatlist" id="chatList"></ul>
+        <div class="chatbox">
+          <label class="cbtn filebtn" title="send a file to everyone">📎<input id="fileInput" type="file" hidden></label>
+          <input id="chatInput" type="text" maxlength="500" placeholder="Message everyone…" autocomplete="off">
+          <button class="cbtn" id="sendBtn">Send</button>
+        </div>
+      </div>
+      <div class="pane" id="peoplePane" hidden><ul class="peoplelist" id="peopleList"></ul></div>
+    </aside>
+  </div>
+  <div class="pop" id="settingsPop" hidden>
+    <label>Name<input id="nameInput" type="text" maxlength="24" autocomplete="off"></label>
+    <label>Microphone<select id="micSel"></select></label>
+    <label>Camera<select id="camSel"></select></label>
+    <p class="hint">Tip: add ?turn=user:pass@host:port to the URL to use your own TURN relay for strict networks.</p>
+    <button class="cbtn" id="settingsClose">Done</button>
+  </div>
+  <div class="leftov" id="leftOverlay" hidden>
+    <p>You left the call.</p>
+    <button class="cbtn big" id="rejoinBtn">Rejoin</button>
+  </div>
+  <div class="hintbar">Share this page URL — everyone who opens it joins the same call · best with 8 or fewer people</div>
+</div>
+<div id="toast"></div>
+<script src="src/call.js">
+</script>
+</body>
+</html>
